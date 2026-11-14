@@ -199,7 +199,7 @@ jobs:
             fi
             python stack.py "${sargs[@]}" 2>&1 | tee stack.log
             rc=${PIPESTATUS[0]}
-            [[ $rc -eq 0 ]] && UPLOADS+="$OUT"$'\n'
+            [[ $rc -eq 0 ]] && UPLOADS+="$OUT"$'\n'"${OUT%.tif}_preview.jpg"$'\n'
           fi
 
           # ======================= TAHAP GRADING ========================
