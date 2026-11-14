@@ -1,0 +1,233 @@
+# Simpan sebagai: .github/workflows/astro-pipeline.yml
+#
+# Cara pakai (bisa dari HP, lewat app GitHub atau browser):
+#   Actions -> "Astro Pipeline" -> Run workflow -> isi form -> Run
+#
+# Struktur folder di repo data lu:
+#   sesi1/DSC-0042/DSC-0042.tif            <- stack sRGB dari Sequator (wajib)
+#   sesi1/DSC-0042/DSC-0042_GraXpert.tiff  <- hanya untuk frame langit murni
+#
+# Catatan: GitHub Actions tidak bisa menanyakan pilihan di tengah run.
+# Semua pilihan diisi di form saat Run workflow. Kalau pipeline berhenti
+# dengan "STOP" (tidak yakin), run akan merah dan ringkasannya bilang
+# pilihan mana yang harus diklik. Tinggal Run workflow lagi.
+
+name: Astro Pipeline
+
+on:
+  workflow_dispatch:
+    inputs:
+      folder:
+        description: "Folder frame di repo (berisi <nama>.tif), mis. sesi1/DSC-0042"
+        required: true
+        type: string
+      milkyway:
+        description: "Ada Milky Way di frame ini?"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - "yes"
+          - "no"
+      mode:
+        description: "Komposisi frame"
+        type: choice
+        default: auto
+        options:
+          - auto
+          - sky
+          - landscape
+      look:
+        description: "Tampilan hasil"
+        type: choice
+        default: default
+        options:
+          - default
+          - stronger-milkyway
+          - softer-milkyway
+          - smoother-nebula
+          - emptier-stars
+          - keep-more-stars
+          - darker-sky
+          - brighter-sky
+          - less-saturated
+      pipeline:
+        description: "Pipeline"
+        type: choice
+        default: display
+        options:
+          - display
+          - legacy
+      extra_set:
+        description: "Opsional: override manual, mis. band_bright=0.6 melt=0.8"
+        required: false
+        default: ""
+        type: string
+      commit_back:
+        description: "Simpan JPG hasil akhir ke repo (lebih gampang diambil dari HP)"
+        type: boolean
+        default: true
+
+concurrency:
+  group: astro-pipeline
+  cancel-in-progress: false
+
+jobs:
+  grade:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    permissions:
+      contents: write   # hanya dipakai kalau commit_back dicentang
+
+    steps:
+      - name: Ambil repo data
+        uses: actions/checkout@v4
+
+      - name: Ambil astro-pipeline
+        uses: actions/checkout@v4
+        with:
+          repository: howar31/astro-pipeline
+          ref: main      # ganti ke tag rilis kalau mau versi terkunci
+          path: _astro_pipeline
+
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+          cache: pip
+          cache-dependency-path: _astro_pipeline/requirements.txt
+
+      - name: Install dependensi
+        run: |
+          python -m pip install -r _astro_pipeline/requirements.txt
+          python _astro_pipeline/check_env.py
+
+      - name: Jalankan pipeline
+        id: run
+        shell: bash
+        env:
+          FOLDER: ${{ inputs.folder }}
+          MILKYWAY: ${{ inputs.milkyway }}
+          MODE: ${{ inputs.mode }}
+          LOOK: ${{ inputs.look }}
+          PIPELINE: ${{ inputs.pipeline }}
+          EXTRA: ${{ inputs.extra_set }}
+        run: |
+          set -uo pipefail
+
+          # --- validasi input teks ---
+          if [[ "$FOLDER" == *".."* || "$FOLDER" == /* ]]; then
+            echo "::error::Folder tidak valid"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [[ ! -d "$FOLDER" ]]; then
+            echo "::error::Folder '$FOLDER' tidak ada di repo"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+          if [[ ! "$EXTRA" =~ ^[A-Za-z0-9_=.\ -]*$ ]]; then
+            echo "::error::extra_set hanya boleh huruf, angka, _ = . - dan spasi"
+            echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+          fi
+
+          # --- preset tampilan (dari tabel di README astro-pipeline) ---
+          case "$LOOK" in
+            stronger-milkyway) sets="band_bright=0.75 band_sat=2.1" ;;
+            softer-milkyway)   sets="band_bright=0.35 band_sat=1.5 usm_amt=1.2" ;;
+            smoother-nebula)   sets="melt=0.85 melt_sigma=3.5" ;;
+            emptier-stars)     sets="erode=5 strength=0.65" ;;
+            keep-more-stars)   sets="erode=3 strength=0.5" ;;
+            darker-sky)        sets="sky_target=0.05 curve_gain=1.3" ;;
+            brighter-sky)      sets="sky_target=0.085" ;;
+            less-saturated)    sets="global_sat=1.15 band_sat=1.4" ;;
+            *)                 sets="" ;;
+          esac
+          sets="$sets $EXTRA"
+          sets="$(echo $sets)"   # rapikan spasi
+
+          args=("$FOLDER" --milkyway "$MILKYWAY" --mode "$MODE" --pipeline "$PIPELINE")
+          if [[ -n "$sets" ]]; then
+            # sengaja tanpa kutip: tiap key=val jadi argumen sendiri (sudah divalidasi)
+            args+=(--set $sets)
+          fi
+
+          python _astro_pipeline/process_folder.py "${args[@]}" 2>&1 | tee run.log
+          rc=${PIPESTATUS[0]}
+
+          if [[ $rc -eq 0 ]]; then
+            python _astro_pipeline/verify_output.py "$FOLDER" 2>&1 | tee -a run.log
+            rc=${PIPESTATUS[0]}
+          fi
+          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+      - name: Ringkasan
+        if: always()
+        shell: bash
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+          FOLDER: ${{ inputs.folder }}
+          DISPATCH_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/astro-pipeline.yml
+        run: |
+          {
+            echo "## Astro Pipeline: \`$FOLDER\`"
+            echo
+            if [[ "${RC:-1}" == "0" ]]; then
+              echo "Selesai, semua pengecekan lulus."
+            elif [[ "${RC:-1}" == "2" ]]; then
+              echo "**Pipeline berhenti karena tidak yakin dan butuh pilihan dari lu:**"
+              echo
+              echo '```'
+              grep -i "STOP" run.log || true
+              echo '```'
+              echo
+              echo "| Pesan STOP | Pilih di form |"
+              echo "| --- | --- |"
+              echo "| Milky Way detection uncertain | milkyway = yes atau no |"
+              echo "| landscape detection uncertain | mode = landscape atau sky |"
+              echo "| GraXpert ... not found | upload \`<nama>_GraXpert.tiff\` ke folder lalu jalankan lagi |"
+              echo "| no Milky Way in this frame | frame di luar cakupan, tidak ada yang dibuat |"
+              echo
+              echo "[Buka form Run workflow]($DISPATCH_URL)"
+            else
+              echo "Gagal (kode $RC). Lihat log langkah **Jalankan pipeline**."
+            fi
+            if [[ -f "$FOLDER/astro_out/processing_info.json" ]]; then
+              echo
+              echo "<details><summary>Keputusan pipeline (processing_info.json)</summary>"
+              echo
+              echo '```json'
+              head -c 4000 "$FOLDER/astro_out/processing_info.json"
+              echo
+              echo '```'
+              echo "</details>"
+            fi
+          } >> "$GITHUB_STEP_SUMMARY"
+
+      - name: Upload hasil
+        if: ${{ steps.run.outputs.rc == '0' }}
+        uses: actions/upload-artifact@v4
+        with:
+          name: astro-out-${{ github.run_id }}
+          path: ${{ inputs.folder }}/astro_out/
+          retention-days: 30
+
+      - name: Simpan JPG hasil ke repo
+        if: ${{ steps.run.outputs.rc == '0' && inputs.commit_back }}
+        shell: bash
+        env:
+          FOLDER: ${{ inputs.folder }}
+        run: |
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add -f "$FOLDER"/astro_out/*_graded_starreduce2.jpg
+          git commit -m "astro: hasil $FOLDER" || echo "Tidak ada perubahan"
+          git push
+
+      - name: Tandai gagal bila perlu
+        if: ${{ steps.run.outputs.rc != '0' }}
+        shell: bash
+        env:
+          RC: ${{ steps.run.outputs.rc }}
+        run: |
+          if [[ "${RC:-1}" == "2" ]]; then
+            echo "::error::Pipeline butuh pilihan dari lu. Buka ringkasan run, lalu Run workflow lagi."
+          else
+            echo "::error::Pipeline gagal (kode $RC)."
+          fi
+          exit "${RC:-1}"
