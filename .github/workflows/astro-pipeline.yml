@@ -1,10 +1,13 @@
 # Simpan sebagai: .github/workflows/astro-pipeline.yml
+# Taruh juga stack.py di root repo yang sama.
 #
 # Cara pakai (bisa dari HP, lewat app GitHub atau browser):
 #   Actions -> "Astro Pipeline" -> Run workflow -> isi form -> Run
 #
-# Struktur folder di repo data lu:
-#   sesi1/DSC-0042/DSC-0042.tif            <- stack sRGB dari Sequator (wajib)
+# Struktur folder di repo:
+#   sesi1/DSC-0042/frames/*.jpg            <- frame mentah (untuk tahap stacking)
+#   sesi1/DSC-0042/mask.png                <- opsional, putih = langit, hitam = foreground
+#   sesi1/DSC-0042/DSC-0042.tif            <- stack sRGB (dibuat stack.py, atau dari Sequator)
 #   sesi1/DSC-0042/DSC-0042_GraXpert.tiff  <- hanya untuk frame langit murni
 #
 # Catatan: GitHub Actions tidak bisa menanyakan pilihan di tengah run.
@@ -18,9 +21,34 @@ on:
   workflow_dispatch:
     inputs:
       folder:
-        description: "Folder frame di repo (berisi <nama>.tif), mis. sesi1/DSC-0042"
+        description: "Folder frame di repo, mis. sesi1/DSC-0042 (frame mentah ada di <folder>/frames)"
         required: true
         type: string
+      stage:
+        description: "Mau ngapain?"
+        type: choice
+        default: stack-lalu-grade
+        options:
+          - stack-lalu-grade
+          - grade-saja
+          - stack-saja
+          - trail-saja
+      mask:
+        description: "Mask langit saat stacking (biar foreground tidak blur)"
+        type: choice
+        default: tanpa
+        options:
+          - tanpa
+          - auto
+          - file-mask.png
+      resize:
+        description: "Skala frame saat stacking (kecil = hemat RAM)"
+        type: choice
+        default: "1.0"
+        options:
+          - "1.0"
+          - "0.75"
+          - "0.5"
       milkyway:
         description: "Ada Milky Way di frame ini?"
         type: choice
@@ -52,7 +80,7 @@ on:
           - brighter-sky
           - less-saturated
       pipeline:
-        description: "Pipeline"
+        description: "Pipeline grading"
         type: choice
         default: display
         options:
@@ -73,9 +101,9 @@ concurrency:
   cancel-in-progress: false
 
 jobs:
-  grade:
+  run:
     runs-on: ubuntu-latest
-    timeout-minutes: 30
+    timeout-minutes: 45
     permissions:
       contents: write   # hanya dipakai kalau commit_back dicentang
 
@@ -101,11 +129,14 @@ jobs:
           python -m pip install -r _astro_pipeline/requirements.txt
           python _astro_pipeline/check_env.py
 
-      - name: Jalankan pipeline
+      - name: Stacking dan grading
         id: run
         shell: bash
         env:
           FOLDER: ${{ inputs.folder }}
+          STAGE: ${{ inputs.stage }}
+          MASK: ${{ inputs.mask }}
+          RESIZE: ${{ inputs.resize }}
           MILKYWAY: ${{ inputs.milkyway }}
           MODE: ${{ inputs.mode }}
           LOOK: ${{ inputs.look }}
@@ -114,62 +145,125 @@ jobs:
         run: |
           set -uo pipefail
 
+          finish() {  # $1 = rc, $2 = jpg hasil grading (opsional)
+            {
+              echo "rc=$1"
+              echo "jpg=${2:-}"
+              echo "paths<<EOF"
+              [[ -n "${UPLOADS:-}" ]] && printf '%s\n' "$UPLOADS"
+              echo "EOF"
+            } >> "$GITHUB_OUTPUT"
+            exit 0
+          }
+          UPLOADS=""
+
           # --- validasi input teks ---
-          if [[ "$FOLDER" == *".."* || "$FOLDER" == /* ]]; then
-            echo "::error::Folder tidak valid"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+          FOLDER="${FOLDER%/}"
+          if [[ "$FOLDER" == *".."* || "$FOLDER" == /* || -z "$FOLDER" ]]; then
+            echo "::error::Folder tidak valid"; finish 1
           fi
           if [[ ! -d "$FOLDER" ]]; then
-            echo "::error::Folder '$FOLDER' tidak ada di repo"; echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+            echo "::error::Folder '$FOLDER' tidak ada di repo"; finish 1
           fi
           if [[ ! "$EXTRA" =~ ^[A-Za-z0-9_=.\ -]*$ ]]; then
-            echo "::error::extra_set hanya boleh huruf, angka, _ = . - dan spasi"
-            echo "rc=1" >> "$GITHUB_OUTPUT"; exit 0
+            echo "::error::extra_set hanya boleh huruf, angka, _ = . - dan spasi"; finish 1
           fi
+          NAME="$(basename "$FOLDER")"
+          STACK_TIF="$FOLDER/$NAME.tif"
+          rc=0
 
-          # --- preset tampilan (dari tabel di README astro-pipeline) ---
-          case "$LOOK" in
-            stronger-milkyway) sets="band_bright=0.75 band_sat=2.1" ;;
-            softer-milkyway)   sets="band_bright=0.35 band_sat=1.5 usm_amt=1.2" ;;
-            smoother-nebula)   sets="melt=0.85 melt_sigma=3.5" ;;
-            emptier-stars)     sets="erode=5 strength=0.65" ;;
-            keep-more-stars)   sets="erode=3 strength=0.5" ;;
-            darker-sky)        sets="sky_target=0.05 curve_gain=1.3" ;;
-            brighter-sky)      sets="sky_target=0.085" ;;
-            less-saturated)    sets="global_sat=1.15 band_sat=1.4" ;;
-            *)                 sets="" ;;
-          esac
-          sets="$sets $EXTRA"
-          sets="$(echo $sets)"   # rapikan spasi
-
-          args=("$FOLDER" --milkyway "$MILKYWAY" --mode "$MODE" --pipeline "$PIPELINE")
-          if [[ -n "$sets" ]]; then
-            # sengaja tanpa kutip: tiap key=val jadi argumen sendiri (sudah divalidasi)
-            args+=(--set $sets)
-          fi
-
-          python _astro_pipeline/process_folder.py "${args[@]}" 2>&1 | tee run.log
-          rc=${PIPESTATUS[0]}
-
-          if [[ $rc -eq 0 ]]; then
-            python _astro_pipeline/verify_output.py "$FOLDER" 2>&1 | tee -a run.log
+          # ======================= TAHAP STACKING =======================
+          if [[ "$STAGE" != "grade-saja" ]]; then
+            if [[ ! -f stack.py ]]; then
+              echo "::error::stack.py tidak ada di root repo"; finish 1
+            fi
+            if [[ ! -d "$FOLDER/frames" ]]; then
+              echo "::error::Frame mentah harus ada di '$FOLDER/frames'"; finish 1
+            fi
+            sargs=("$FOLDER/frames" --resize "$RESIZE")
+            if [[ "$STAGE" == "trail-saja" ]]; then
+              OUT="$FOLDER/${NAME}_trail.tif"
+              sargs+=(-o "$OUT" --mode trail)
+            else
+              OUT="$STACK_TIF"
+              sargs+=(-o "$OUT" --mode average)
+              case "$MASK" in
+                auto)          sargs+=(--auto-mask --save-mask "$FOLDER/mask_auto.png"); UPLOADS+="$FOLDER/mask_auto.png"$'\n' ;;
+                file-mask.png)
+                  if [[ ! -f "$FOLDER/mask.png" ]]; then
+                    echo "::error::Pilih file-mask.png tapi '$FOLDER/mask.png' tidak ada"; finish 1
+                  fi
+                  sargs+=(--mask "$FOLDER/mask.png") ;;
+              esac
+            fi
+            python stack.py "${sargs[@]}" 2>&1 | tee stack.log
             rc=${PIPESTATUS[0]}
+            [[ $rc -eq 0 ]] && UPLOADS+="$OUT"$'\n'
           fi
-          echo "rc=$rc" >> "$GITHUB_OUTPUT"
+
+          # ======================= TAHAP GRADING ========================
+          if [[ $rc -eq 0 && ( "$STAGE" == "grade-saja" || "$STAGE" == "stack-lalu-grade" ) ]]; then
+            if [[ ! -f "$STACK_TIF" ]]; then
+              echo "::error::'$STACK_TIF' tidak ada. Jalankan stacking dulu atau taruh stack dari Sequator di sana."; finish 1
+            fi
+            case "$LOOK" in
+              stronger-milkyway) sets="band_bright=0.75 band_sat=2.1" ;;
+              softer-milkyway)   sets="band_bright=0.35 band_sat=1.5 usm_amt=1.2" ;;
+              smoother-nebula)   sets="melt=0.85 melt_sigma=3.5" ;;
+              emptier-stars)     sets="erode=5 strength=0.65" ;;
+              keep-more-stars)   sets="erode=3 strength=0.5" ;;
+              darker-sky)        sets="sky_target=0.05 curve_gain=1.3" ;;
+              brighter-sky)      sets="sky_target=0.085" ;;
+              less-saturated)    sets="global_sat=1.15 band_sat=1.4" ;;
+              *)                 sets="" ;;
+            esac
+            sets="$sets $EXTRA"
+            sets="$(echo $sets)"   # rapikan spasi
+
+            args=("$FOLDER" --milkyway "$MILKYWAY" --mode "$MODE" --pipeline "$PIPELINE")
+            if [[ -n "$sets" ]]; then
+              # sengaja tanpa kutip: tiap key=val jadi argumen sendiri (sudah divalidasi)
+              args+=(--set $sets)
+            fi
+
+            python _astro_pipeline/process_folder.py "${args[@]}" 2>&1 | tee run.log
+            rc=${PIPESTATUS[0]}
+            if [[ $rc -eq 0 ]]; then
+              python _astro_pipeline/verify_output.py "$FOLDER" 2>&1 | tee -a run.log
+              rc=${PIPESTATUS[0]}
+            fi
+            if [[ $rc -eq 0 ]]; then
+              UPLOADS+="$FOLDER/astro_out/"$'\n'
+              finish 0 "$FOLDER/astro_out/${NAME}_graded_starreduce2.jpg"
+            fi
+          fi
+          finish $rc
 
       - name: Ringkasan
         if: always()
         shell: bash
         env:
           RC: ${{ steps.run.outputs.rc }}
+          STAGE: ${{ inputs.stage }}
           FOLDER: ${{ inputs.folder }}
           DISPATCH_URL: ${{ github.server_url }}/${{ github.repository }}/actions/workflows/astro-pipeline.yml
         run: |
+          FOLDER="${FOLDER%/}"
           {
-            echo "## Astro Pipeline: \`$FOLDER\`"
+            echo "## Astro Pipeline: \`$FOLDER\` ($STAGE)"
             echo
+            if [[ -f stack.log ]]; then
+              echo "<details><summary>Log stacking</summary>"
+              echo
+              echo '```'
+              tail -n 40 stack.log
+              echo '```'
+              echo "</details>"
+              echo
+            fi
             if [[ "${RC:-1}" == "0" ]]; then
-              echo "Selesai, semua pengecekan lulus."
-            elif [[ "${RC:-1}" == "2" ]]; then
+              echo "Selesai."
+            elif [[ "${RC:-1}" == "2" && -f run.log ]] && grep -q "STOP" run.log; then
               echo "**Pipeline berhenti karena tidak yakin dan butuh pilihan dari lu:**"
               echo
               echo '```'
@@ -183,9 +277,11 @@ jobs:
               echo "| GraXpert ... not found | upload \`<nama>_GraXpert.tiff\` ke folder lalu jalankan lagi |"
               echo "| no Milky Way in this frame | frame di luar cakupan, tidak ada yang dibuat |"
               echo
+              echo "Jalankan lagi dengan pilihan itu. Stack hasil run ini tidak disimpan di repo, jadi stacking ikut diulang. **grade-saja** hanya cocok kalau \`<nama>.tif\` sudah ada di folder (mis. dari Sequator)."
+              echo
               echo "[Buka form Run workflow]($DISPATCH_URL)"
             else
-              echo "Gagal (kode $RC). Lihat log langkah **Jalankan pipeline**."
+              echo "Gagal (kode ${RC:-?}). Lihat log langkah **Stacking dan grading**."
             fi
             if [[ -f "$FOLDER/astro_out/processing_info.json" ]]; then
               echo
@@ -204,19 +300,20 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: astro-out-${{ github.run_id }}
-          path: ${{ inputs.folder }}/astro_out/
+          path: ${{ steps.run.outputs.paths }}
+          if-no-files-found: warn
           retention-days: 30
 
       - name: Simpan JPG hasil ke repo
-        if: ${{ steps.run.outputs.rc == '0' && inputs.commit_back }}
+        if: ${{ steps.run.outputs.rc == '0' && steps.run.outputs.jpg != '' && inputs.commit_back }}
         shell: bash
         env:
-          FOLDER: ${{ inputs.folder }}
+          JPG: ${{ steps.run.outputs.jpg }}
         run: |
           git config user.name "github-actions[bot]"
           git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
-          git add -f "$FOLDER"/astro_out/*_graded_starreduce2.jpg
-          git commit -m "astro: hasil $FOLDER" || echo "Tidak ada perubahan"
+          git add -f "$JPG"
+          git commit -m "astro: hasil $JPG" || echo "Tidak ada perubahan"
           git push
 
       - name: Tandai gagal bila perlu
@@ -226,8 +323,8 @@ jobs:
           RC: ${{ steps.run.outputs.rc }}
         run: |
           if [[ "${RC:-1}" == "2" ]]; then
-            echo "::error::Pipeline butuh pilihan dari lu. Buka ringkasan run, lalu Run workflow lagi."
+            echo "::error::Butuh pilihan dari lu atau input salah. Buka ringkasan run, lalu Run workflow lagi."
           else
-            echo "::error::Pipeline gagal (kode $RC)."
+            echo "::error::Gagal (kode ${RC:-?})."
           fi
           exit "${RC:-1}"
