@@ -325,6 +325,11 @@ def main():
         return 1
     os.makedirs(os.path.dirname(os.path.abspath(args.out)), exist_ok=True)
     write_tiff(args.out, rgb, compress=not args.no_compress)
+    # pratinjau 8-bit: TIFF 16-bit sering tampil rusak di galeri HP
+    preview = os.path.splitext(args.out)[0] + "_preview.jpg"
+    bgr8 = cv2.cvtColor((np.clip(rgb, 0, 1) * 255.0 + 0.5).astype(np.uint8), cv2.COLOR_RGB2BGR)
+    cv2.imwrite(preview, bgr8, [cv2.IMWRITE_JPEG_QUALITY, 92])
+    log(f"pratinjau: {preview}")
     log(f"selesai: {args.out}")
     return 0
 
